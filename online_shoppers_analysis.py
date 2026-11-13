@@ -1,5 +1,5 @@
 '''
-Annabel Luo
+Annabel Luo, Elle Zhou
 ACAD 191, Fall 2026
 luoannab@usc.edu
 Exercise 8
@@ -10,6 +10,14 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from pandas.plotting import scatter_matrix
 from pathlib import Path
+from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import f1_score
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.tree import DecisionTreeClassifier
 
 
 PROJECT_FOLDER = Path(__file__).resolve().parent
@@ -155,8 +163,132 @@ def correlations(data):
     corr_matrix.to_csv(PROJECT_FOLDER / "online_shoppers_correlations.csv")
 
 
+# Custom transformer: remove selected attributes and add a browsing measure.
+class ShoppingFeatures(BaseEstimator, TransformerMixin):
+    def __init__(self, excluded_features=("Informational_Duration", "Weekend", "SpecialDay")):
+        self.excluded_features = excluded_features
+
+    def fit(self, X, y=None):
+        # These changes use each row's values, so no statistics are learned.
+        return self
+
+    def transform(self, X):
+        prepared = X.drop(columns=list(self.excluded_features)).copy()
+        prepared["ProductTimePerPage"] = 0.0
+        has_product_pages = prepared["ProductRelated"] > 0
+        prepared.loc[has_product_pages, "ProductTimePerPage"] = (
+            prepared.loc[has_product_pages, "ProductRelated_Duration"]
+            / prepared.loc[has_product_pages, "ProductRelated"]
+        )
+        return prepared
+
+
+# Function: prepare_data
+# Purpose: Split data and fit a reusable feature preparation pipeline.
+# Parameters: data - the original dataset as a DataFrame
+# Side effects: Prints the prepared feature sizes and an encoding preview
+# Returns: Original train/test features, train/test labels, and fitted pipeline
+def prepare_data(data):
+    excluded_features = ("Informational_Duration", "Weekend", "SpecialDay")
+    X = data.drop(columns=["Revenue"])
+    y = data["Revenue"].astype(int)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # The integer codes are categories too; their numbers imply no ranking.
+    categorical_columns = ["Month", "VisitorType", "OperatingSystems",
+                           "Browser", "Region", "TrafficType"]
+    numeric_columns = ["Administrative", "Administrative_Duration", "Informational",
+                       "ProductRelated", "ProductRelated_Duration", "BounceRates",
+                       "ExitRates", "PageValues", "ProductTimePerPage"]
+
+    numeric_pipeline = Pipeline([
+        ("scaler", StandardScaler())
+    ])
+    categorical_pipeline = Pipeline([
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+    ])
+    column_preparation = ColumnTransformer(
+        [("numeric", numeric_pipeline, numeric_columns),
+         ("categorical", categorical_pipeline, categorical_columns)],
+        remainder="drop",
+        verbose_feature_names_out=False
+    )
+    # No imputer is needed: the current dataset has no missing values.
+    preprocessor = Pipeline([
+        ("feature_preparation", ShoppingFeatures(excluded_features=excluded_features)),
+        ("column_preparation", column_preparation)
+    ])
+
+    # Learn scaling and categories from training data only, then reuse for test.
+    train_values = preprocessor.fit_transform(X_train)
+    test_values = preprocessor.transform(X_test)
+    feature_names = preprocessor.named_steps["column_preparation"].get_feature_names_out()
+    X_train_prepared = pd.DataFrame(train_values, columns=feature_names,
+                                    index=X_train.index).astype(float)
+    X_test_prepared = pd.DataFrame(test_values, columns=feature_names,
+                                   index=X_test.index).astype(float)
+
+    print("\nDATA PREPARATION PIPELINE")
+    print("Attributes excluded from model inputs:", excluded_features)
+    print("New attribute: ProductTimePerPage = product browsing time / product pages")
+    print("ProductTimePerPage is 0 when no product pages were visited.")
+    print("Standardized numeric columns:", numeric_columns)
+    print("Encoded categorical columns:", categorical_columns)
+    print(preprocessor)
+    print("Training features:", X_train_prepared.shape)
+    print("Test features:", X_test_prepared.shape)
+    print("Revenue labels: 0 = no purchase; 1 = purchase")
+    print("Preview of encoded Month and VisitorType columns:")
+    preview_columns = [name for name in feature_names
+                       if name.startswith(("Month_", "VisitorType_"))]
+    print(X_train_prepared[preview_columns].head().to_string())
+
+    # Return original columns so cross-validation can refit preprocessing per fold.
+    return X_train, X_test, y_train, y_test, preprocessor
+
+
+# Function: compare_models
+# Purpose: Train two classifiers and compare five-fold cross-validation F1 scores.
+# Parameters: X_train, y_train - training data; preprocessor - preparation pipeline
+# Side effects: Prints predictions, training F1, fold scores, mean, and deviation
+# Returns: A dictionary containing each model's mean cross-validation F1
+def compare_models(X_train, y_train, preprocessor):
+    models = {
+        "Decision Tree": DecisionTreeClassifier(random_state=42),
+        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42)
+    }
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    results = {}
+
+    print("\nMODEL COMPARISON - 5-FOLD CROSS-VALIDATION")
+    print("Score: F1 for purchase (Revenue=1). Higher is better.")
+    print("Only the training set is used; the separate test set is reserved.")
+    for name, model in models.items():
+        model_pipeline = Pipeline([
+            ("preparation", clone(preprocessor)),
+            ("classifier", model)
+        ])
+        model_pipeline.fit(X_train, y_train)
+        predictions = model_pipeline.predict(X_train)
+        print("\n" + name)
+        print("Predictions:", predictions[:5])
+        print("Labels:", y_train.iloc[:5].to_list())
+        print("Training F1:", round(f1_score(y_train, predictions), 4))
+
+        # Include preprocessing inside CV so each fold learns its own settings.
+        scores = cross_val_score(model_pipeline, X_train, y_train,
+                                 scoring="f1", cv=cv, error_score="raise")
+        print("CV Scores:", scores.round(4))
+        print("CV Mean:", round(scores.mean(), 4))
+        print("CV Standard deviation:", round(scores.std(), 4))
+        results[name] = scores.mean()
+
+
+
 # Function: main
-# Purpose: Load the CSV and run all three exploratory analysis tasks.
+# Purpose: Explore the CSV, prepare features, and compare Revenue classifiers.
 # Parameters: None
 # Side effects: Prints dataset information and displays histograms
 # Returns: None
@@ -170,10 +302,12 @@ def main():
     if data is not None:
         explore_data(data)
         correlations(data)
+        X_train, X_test, y_train, y_test, preprocessor = prepare_data(data)
+        compare_models(X_train, y_train, preprocessor)
         visualize_data(data)
         scatter_plot(data)
         scatter_all_numeric(data)
-        print("\nAll three tasks completed. Charts and correlations saved in:")
+        print("\nAnalysis and model comparison completed. Charts and correlations saved in:")
         print(PROJECT_FOLDER)
         print("Close the plot windows to finish the program.")
         plt.show()
