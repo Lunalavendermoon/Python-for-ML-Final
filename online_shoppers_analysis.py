@@ -13,8 +13,12 @@ from pathlib import Path
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import f1_score
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.metrics import (f1_score, precision_score, recall_score, accuracy_score,
+                             classification_report, confusion_matrix,
+                             ConfusionMatrixDisplay)
+from sklearn.model_selection import (train_test_split, StratifiedKFold,
+                                     cross_val_score, cross_validate, RandomizedSearchCV, GridSearchCV,
+                                     FixedThresholdClassifier)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.tree import DecisionTreeClassifier
@@ -255,9 +259,18 @@ def prepare_data(data):
 # Side effects: Prints predictions, training F1, fold scores, mean, and deviation
 # Returns: A dictionary containing each model's mean cross-validation F1
 def compare_models(X_train, y_train, preprocessor):
+    forest_clf = RandomForestClassifier(
+        n_estimators=100,
+        max_features="sqrt",
+        max_depth=None,
+        min_samples_split=2,
+        bootstrap=True,
+        oob_score=False,
+        random_state=42
+    )
     models = {
         "Decision Tree": DecisionTreeClassifier(random_state=42),
-        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42)
+        "Random Forest": forest_clf
     }
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     results = {}
@@ -287,6 +300,239 @@ def compare_models(X_train, y_train, preprocessor):
 
 
 
+# training and testing - round 1
+# Reference: load_data6.py, adapted to classification and RandomizedSearchCV.
+# Test each sampled setting on validation folds; reserve the final test set.
+def tune_random_forest(X_train, y_train, preprocessor):
+    forest_clf = RandomForestClassifier(
+        n_estimators=100,
+        max_features="sqrt",
+        max_depth=None,
+        min_samples_split=2,
+        bootstrap=True,
+        oob_score=False,
+        random_state=42
+    )
+    forest_pipeline = Pipeline([
+        ("preparation", clone(preprocessor)),
+        ("classifier", forest_clf)
+    ])
+    # Search overrides these two starting values; the other settings stay fixed.
+    param_distributions = {
+        "classifier__n_estimators": [100, 200, 300],
+        "classifier__max_features": ["sqrt", "log2", 0.3]
+    }
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    random_search = RandomizedSearchCV(
+        forest_pipeline, param_distributions, n_iter=5, cv=cv,
+        scoring="f1", random_state=42, refit=True,
+        return_train_score=True, error_score="raise"
+    )
+
+    print("\nTRAINING AND TESTING - ROUND 1: RANDOMIZED SEARCH")
+    print("5 sampled combinations x 5 folds = 25 CV fits, then refit the best.")
+    print("Score: F1 for purchase (Revenue=1). Higher is better.")
+    random_search.fit(X_train, y_train)
+
+    # Like load_data6.py, print the score for each tested parameter combination.
+    cvres = random_search.cv_results_
+    for mean_score, std_score, params in zip(
+            cvres["mean_test_score"], cvres["std_test_score"], cvres["params"]):
+        print("CV F1:", round(mean_score, 4),
+              "Standard deviation:", round(std_score, 4), params)
+
+    print("Best parameters:", random_search.best_params_)
+    print("Best mean CV F1:", round(random_search.best_score_, 4))
+    print("Final test set remains reserved until tuning is finished.")
+    return random_search
+
+
+# training and testing - round 2
+# Reference: load_data6.py; refine round 1 using GridSearchCV.
+# More features may help splits; larger leaves may reduce overfitting.
+def tune_random_forest_round2(X_train, y_train, preprocessor):
+    forest_clf = RandomForestClassifier(
+        n_estimators=300,
+        max_features=0.3,
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        bootstrap=True,
+        oob_score=False,
+        random_state=42
+    )
+    forest_pipeline = Pipeline([
+        ("preparation", clone(preprocessor)),
+        ("classifier", forest_clf)
+    ])
+    param_grid = {
+        "classifier__n_estimators": [300, 500],
+        "classifier__max_features": [0.3, 0.4, 0.5],
+        "classifier__min_samples_leaf": [1, 2, 4]
+    }
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    grid_search = GridSearchCV(
+        forest_pipeline, param_grid, cv=cv,
+        scoring={"f1": "f1", "precision": "precision", "recall": "recall"},
+        refit="f1", n_jobs=2,
+        return_train_score=True, error_score="raise", verbose=1
+    )
+
+    print("\nTRAINING AND TESTING - ROUND 2: GRID SEARCH")
+    print("18 combinations x 5 folds = 90 CV fits, then refit the best.")
+    print("Use the same split, preprocessing and folds as round 1.")
+    grid_search.fit(X_train, y_train)
+
+    cvres = grid_search.cv_results_
+    round1_index = None
+    for index, params in enumerate(cvres["params"]):
+        print("CV F1:", round(cvres["mean_test_f1"][index], 4),
+              "Standard deviation:", round(cvres["std_test_f1"][index], 4),
+              "Precision:", round(cvres["mean_test_precision"][index], 4),
+              "Recall:", round(cvres["mean_test_recall"][index], 4), params)
+        if (params["classifier__n_estimators"] == 300
+                and params["classifier__max_features"] == 0.3
+                and params["classifier__min_samples_leaf"] == 1):
+            round1_index = index
+
+    print("Best parameters:", grid_search.best_params_)
+    print("Best mean CV F1:", round(grid_search.best_score_, 4))
+    best = grid_search.best_index_
+    print("Best model mean training F1:", round(cvres["mean_train_f1"][best], 4))
+    if round1_index is not None:
+        baseline_f1 = cvres["mean_test_f1"][round1_index]
+        print("Round 1 winner rechecked on the same folds:", round(baseline_f1, 4))
+        print("F1 change from round 1:", round(grid_search.best_score_ - baseline_f1, 4))
+    print("Final test set remains reserved; these are cross-validation results.")
+    return grid_search
+
+
+# training and testing - round 3
+# Reference: load_data6.py; use grid search to target missed purchasers.
+# Choose the threshold inside CV along with forest settings, never on the test set.
+def tune_random_forest_round3(X_train, y_train, preprocessor):
+    forest_clf = RandomForestClassifier(
+        n_estimators=500,
+        max_features=0.5,
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=4,
+        bootstrap=True,
+        oob_score=False,
+        random_state=42
+    )
+    forest_pipeline = Pipeline([
+        ("preparation", clone(preprocessor)),
+        ("classifier", forest_clf)
+    ])
+    threshold_clf = FixedThresholdClassifier(
+        clone(forest_clf), response_method="predict_proba", pos_label=1
+    )
+    param_grid = [
+        # Keep round 2's exact model as a control, using its original predict().
+        {"classifier": [clone(forest_clf)]},
+        {
+            "classifier": [threshold_clf],
+            "classifier__estimator__max_features": [0.5, 0.75],
+            "classifier__estimator__min_samples_leaf": [4, 8],
+            "classifier__estimator__class_weight": [None, "balanced"],
+            "classifier__threshold": [0.25, 0.35, 0.5]
+        }
+    ]
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    grid_search = GridSearchCV(
+        forest_pipeline, param_grid, cv=cv,
+        scoring={"f1": "f1", "precision": "precision", "recall": "recall"},
+        refit="f1", n_jobs=4, return_train_score=True,
+        error_score="raise", verbose=2
+    )
+
+    print("\nTRAINING AND TESTING - ROUND 3: GRID SEARCH")
+    print("24 new combinations + round 2 control = 25 candidates, 125 CV fits.")
+    print("Same five folds and preprocessing; choose the highest mean F1.")
+    grid_search.fit(X_train, y_train)
+
+    cvres = grid_search.cv_results_
+    for index, params in enumerate(cvres["params"]):
+        print("CV F1:", round(cvres["mean_test_f1"][index], 4),
+              "Precision:", round(cvres["mean_test_precision"][index], 4),
+              "Recall:", round(cvres["mean_test_recall"][index], 4), params)
+    best = grid_search.best_index_
+    print("Best parameters:", grid_search.best_params_)
+    print("Best mean CV F1:", round(grid_search.best_score_, 4))
+    print("Best mean precision:", round(cvres["mean_test_precision"][best], 4))
+    print("Best mean recall:", round(cvres["mean_test_recall"][best], 4))
+    print("Round 2 control CV F1:", round(cvres["mean_test_f1"][0], 4))
+    print("Final test set remains reserved; these are cross-validation results.")
+    return grid_search
+
+
+# training and testing - cross-validation of the selected model
+# Recheck the fixed winning settings and record all four comparison metrics.
+def cross_validate_selected_model(model, X_train, y_train):
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    results = cross_validate(
+        clone(model), X_train, y_train, cv=cv,
+        scoring={"precision": "precision", "recall": "recall",
+                 "accuracy": "accuracy", "f1": "f1"},
+        return_train_score=True, n_jobs=4, error_score="raise"
+    )
+    print("\nFINAL MODEL - FIVE-FOLD CROSS-VALIDATION")
+    for metric in ("precision", "recall", "accuracy", "f1"):
+        scores = results["test_" + metric]
+        print(metric, "fold scores:", scores.round(4))
+        print(metric, "CV mean:", round(scores.mean(), 4),
+              "standard deviation:", round(scores.std(), 4))
+    return results
+
+
+# training and testing - final evaluation
+# Run after model selection is finished. Predict with the fitted pipeline only.
+def evaluate_final_model(model, X_train, y_train, X_test, y_test, cv_results=None):
+    print("\nFINAL EVALUATION - SELECTED ROUND 3 MODEL")
+    scores = {}
+    for name, X, y in [("Training", X_train, y_train), ("Test", X_test, y_test)]:
+        predictions = model.predict(X)
+        scores[name] = {
+            "f1": f1_score(y, predictions),
+            "precision": precision_score(y, predictions),
+            "recall": recall_score(y, predictions),
+            "accuracy": accuracy_score(y, predictions)
+        }
+        print(name, "rows:", len(y))
+        for metric, value in scores[name].items():
+            print(name, metric + ":", round(value, 4))
+        if name == "Test":
+            test_predictions = predictions
+
+    matrix = confusion_matrix(y_test, test_predictions, labels=[0, 1])
+    print("\nTEST CLASSIFICATION REPORT")
+    print(classification_report(y_test, test_predictions,
+                                target_names=["No purchase", "Purchase"], digits=4))
+    print("TEST CONFUSION MATRIX - rows actual, columns predicted; order 0, 1")
+    print(matrix)
+    print("No-purchase baseline test accuracy:", round((y_test == 0).mean(), 4))
+    if cv_results is not None:
+        print("\nCROSS-VALIDATION VERSUS FINAL TEST SET")
+        for metric in ("precision", "recall", "accuracy", "f1"):
+            cv_mean = cv_results["test_" + metric].mean()
+            test_score = scores["Test"][metric]
+            print(metric, "CV:", round(cv_mean, 4), "Test:", round(test_score, 4),
+                  "Change:", round(test_score - cv_mean, 4))
+    figure, axis = plt.subplots(figsize=(6, 5))
+    display = ConfusionMatrixDisplay(matrix, display_labels=["No purchase", "Purchase"])
+    display.plot(ax=axis, cmap="Blues", colorbar=False, values_format="d")
+    axis.grid(False)
+    axis.set_title("Selected Random Forest - Final Test Set")
+    figure.tight_layout()
+    figure.savefig(PROJECT_FOLDER / "online_shoppers_test_confusion_matrix.png", dpi=180)
+    scores["confusion_matrix"] = matrix.tolist()
+    scores["classification_report"] = classification_report(
+        y_test, test_predictions, target_names=["No purchase", "Purchase"], output_dict=True
+    )
+    return scores
+
+
 # Function: main
 # Purpose: Explore the CSV, prepare features, and compare Revenue classifiers.
 # Parameters: None
@@ -304,6 +550,16 @@ def main():
         correlations(data)
         X_train, X_test, y_train, y_test, preprocessor = prepare_data(data)
         compare_models(X_train, y_train, preprocessor)
+        # training and testing - round 1
+        tune_random_forest(X_train, y_train, preprocessor)
+        # training and testing - round 2
+        tune_random_forest_round2(X_train, y_train, preprocessor)
+        # training and testing - round 3
+        round3_search = tune_random_forest_round3(X_train, y_train, preprocessor)
+        # training and testing - final evaluation
+        final_cv = cross_validate_selected_model(round3_search.best_estimator_, X_train, y_train)
+        evaluate_final_model(round3_search.best_estimator_, X_train, y_train, X_test, y_test,
+                             cv_results=final_cv)
         visualize_data(data)
         scatter_plot(data)
         scatter_all_numeric(data)
